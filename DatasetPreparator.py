@@ -45,7 +45,7 @@ class DatasetPreparator:
             
             return aligned_image
         except Exception as e:
-            print(f"Warning: Could not align faces - {str(e)}")
+            print(f"Could not align faces - {str(e)}")
             return image
     
     def detect_damage(self, image):

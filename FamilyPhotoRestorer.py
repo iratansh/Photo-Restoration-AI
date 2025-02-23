@@ -1,23 +1,34 @@
 from ConvBlock import ConvBlock
 import torch.nn as nn
-import torch, transforms, cv2, face_recognition
+import torch
+import cv2
+import face_recognition
 import numpy as np
 from DeblurNetwork import DeblurNetwork
 from ColorizationNetwork import ColorizationNetwork
 from DamageRepairNetwork import DamageRepairNetwork
 from FaceEnhancementNetwork import FaceEnhancementNetwork
 from PIL import Image
+import torchvision.transforms as transforms
 
 class FamilyPhotoRestorer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.deblur_net = self._add_spectral_norm(DeblurNetwork())
-        self.colorizer = self._add_spectral_norm(ColorizationNetwork())
-        self.damage_repair = self._add_spectral_norm(DamageRepairNetwork())
-        self.face_enhancer = self._add_spectral_norm(FaceEnhancementNetwork())
+        self.deblur_net = DeblurNetwork()
+        self.colorizer = ColorizationNetwork()
+        self.damage_repair = DamageRepairNetwork()
+        self.face_enhancer = FaceEnhancementNetwork()
         
-    def _add_spectral_norm(self, module):
-        return torch.nn.utils.spectral_norm(module)
+        # Apply spectral norm to conv layers instead of entire networks
+        self._apply_spectral_norm_to_conv_layers(self.deblur_net)
+        self._apply_spectral_norm_to_conv_layers(self.colorizer)
+        self._apply_spectral_norm_to_conv_layers(self.damage_repair)
+        self._apply_spectral_norm_to_conv_layers(self.face_enhancer)
+
+    def _apply_spectral_norm_to_conv_layers(self, module):
+        for layer in module.modules():
+            if isinstance(layer, nn.Conv2d):
+                torch.nn.utils.spectral_norm(layer)
 
     def forward(self, x):
         x = self._preprocess(x)
@@ -115,7 +126,6 @@ class FamilyPhotoRestorer(nn.Module):
     def create_composite_reference(self, image_paths, output_path):
         images = [Image.open(path) for path in image_paths]
         
-    
         aligned_images = []
         for img in images:
             aligned = self.align_image(img, images[0])
@@ -136,3 +146,100 @@ class FamilyPhotoRestorer(nn.Module):
         composite = np.clip(composite, 0, 255).astype(np.uint8)
         
         Image.fromarray(composite).save(output_path)
+
+    def repair_stains(self, img_array):
+        # Convert to LAB color space to better detect stains
+        lab = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
+        l_channel = lab[:,:,0]
+        
+        # Threshold to detect stains (darker regions)
+        _, stain_mask = cv2.threshold(l_channel, 100, 255, cv2.THRESH_BINARY_INV)
+        
+        # Clean up mask
+        kernel = np.ones((5,5), np.uint8)
+        stain_mask = cv2.dilate(stain_mask, kernel, iterations=1)
+        stain_mask = cv2.erode(stain_mask, kernel, iterations=1)
+        
+        # Inpaint stains
+        return cv2.inpaint(img_array, stain_mask, 3, cv2.INPAINT_NS)
+
+    def repair_scratches(self, img_array):
+        # Convert to grayscale
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        
+        # Detect edges
+        edges = cv2.Canny(gray, 50, 150)
+        
+        # Create scratch mask
+        kernel = np.ones((3,3), np.uint8)
+        scratch_mask = cv2.dilate(edges, kernel, iterations=1)
+        
+        # Inpaint scratches
+        return cv2.inpaint(img_array, scratch_mask, 3, cv2.INPAINT_NS)
+
+    def detect_damage(self, image):
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+            
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        
+        # Detect edges
+        edges = cv2.Canny(gray, 50, 150)
+        
+        # Detect texture anomalies
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        texture = cv2.Laplacian(blur, cv2.CV_64F).var()
+        
+        # Create damage mask
+        mask = np.zeros_like(gray)
+        mask[edges > 0] = 1
+        mask[texture < 100] = 1
+        
+        # Clean up mask
+        kernel = np.ones((5,5), np.uint8)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+        mask = cv2.erode(mask, kernel, iterations=1)
+        
+        return mask
+
+    def align_image(self, source, target):
+        # Convert images to numpy arrays if they're PIL images
+        if isinstance(source, Image.Image):
+            source = np.array(source)
+        if isinstance(target, Image.Image):
+            target = np.array(target)
+        
+        # Convert to grayscale
+        source_gray = cv2.cvtColor(source, cv2.COLOR_RGB2GRAY)
+        target_gray = cv2.cvtColor(target, cv2.COLOR_RGB2GRAY)
+        
+        # Detect ORB features and compute descriptors
+        orb = cv2.ORB_create()
+        kp1, des1 = orb.detectAndCompute(source_gray, None)
+        kp2, des2 = orb.detectAndCompute(target_gray, None)
+        
+        if des1 is None or des2 is None:
+            return source
+        
+        # Match features
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(des1, des2)
+        
+        # Sort matches by distance
+        matches = sorted(matches, key=lambda x: x.distance)
+        
+        # Get corresponding points
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        
+        # Find homography
+        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        
+        if H is None:
+            return source
+        
+        # Warp source image
+        height, width = target.shape[:2]
+        aligned = cv2.warpPerspective(source, H, (width, height))
+        
+        return aligned
